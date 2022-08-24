@@ -33,8 +33,8 @@ from ...modeling_outputs import (
     Seq2SeqLMOutput,
     Seq2SeqModelOutput,
 )
-from ...modeling_utils import PreTrainedModel
-from ...pytorch_utils import ALL_LAYERNORM_LAYERS, find_pruneable_heads_and_indices, prune_linear_layer
+from ...modeling_utils import PreTrainedModel, find_pruneable_heads_and_indices, prune_linear_layer
+from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import (
     DUMMY_INPUTS,
     DUMMY_MASK,
@@ -284,11 +284,10 @@ class T5DenseActDense(nn.Module):
         self.wi = nn.Linear(config.d_model, config.d_ff, bias=False)
         self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout_rate)
-        self.act = ACT2FN[config.dense_act_fn]
 
     def forward(self, hidden_states):
         hidden_states = self.wi(hidden_states)
-        hidden_states = self.act(hidden_states)
+        hidden_states = nn.functional.relu(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.wo(hidden_states)
         return hidden_states
@@ -323,13 +322,23 @@ class T5LayerFF(nn.Module):
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
-    def forward(self, hidden_states):
+    def _forward(self, hidden_states):
         forwarded_states = self.layer_norm(hidden_states)
         forwarded_states = self.DenseReluDense(forwarded_states)
         hidden_states = hidden_states + self.dropout(forwarded_states)
         return hidden_states
 
 
+    def forward(self, hidden_states):
+        # many t5/mt5 models are trained in bfloat16 and don't do well under mixed precision (fp16).
+        # It appears that it's enough to disable autocast for this FF layer to avoid inf/nan
+        # problems for the whole model
+        if torch.is_autocast_enabled():
+            with torch.cuda.amp.autocast(enabled=False):
+                return self._forward(hidden_states)
+        else:
+            return self._forward(hidden_states)
+    
 class T5Attention(nn.Module):
     def __init__(self, config: T5Config, has_relative_attention_bias=False):
         super().__init__()
@@ -406,16 +415,16 @@ class T5Attention(nn.Module):
         is_small = relative_position < max_exact
 
         # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
-        relative_position_if_large = max_exact + (
+        relative_postion_if_large = max_exact + (
             torch.log(relative_position.float() / max_exact)
             / math.log(max_distance / max_exact)
             * (num_buckets - max_exact)
         ).to(torch.long)
-        relative_position_if_large = torch.min(
-            relative_position_if_large, torch.full_like(relative_position_if_large, num_buckets - 1)
+        relative_postion_if_large = torch.min(
+            relative_postion_if_large, torch.full_like(relative_postion_if_large, num_buckets - 1)
         )
 
-        relative_buckets += torch.where(is_small, relative_position, relative_position_if_large)
+        relative_buckets += torch.where(is_small, relative_position, relative_postion_if_large)
         return relative_buckets
 
     def compute_bias(self, query_length, key_length, device=None):
@@ -765,8 +774,6 @@ class T5PreTrainedModel(PreTrainedModel):
             # Mesh TensorFlow embeddings initialization
             # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L1624
             module.shared.weight.data.normal_(mean=0.0, std=factor * 1.0)
-            if hasattr(module, "lm_head") and not self.config.tie_word_embeddings:
-                module.lm_head.weight.data.normal_(mean=0.0, std=factor * 1.0)
         elif isinstance(module, T5DenseActDense):
             # Mesh TensorFlow FF initialization
             # See https://github.com/tensorflow/mesh/blob/master/mesh_tensorflow/transformer/transformer_layers.py#L56
@@ -808,10 +815,9 @@ class T5PreTrainedModel(PreTrainedModel):
         decoder_start_token_id = self.config.decoder_start_token_id
         pad_token_id = self.config.pad_token_id
 
-        assert decoder_start_token_id is not None, (
-            "self.model.config.decoder_start_token_id has to be defined. In T5 it is usually set to the pad_token_id."
-            " See T5 docs for more information"
-        )
+        assert (
+            decoder_start_token_id is not None
+        ), "self.model.config.decoder_start_token_id has to be defined. In T5 it is usually set to the pad_token_id. See T5 docs for more information"
 
         # shift inputs to the right
         if is_torch_fx_proxy(input_ids):
@@ -955,7 +961,7 @@ class T5Stack(T5PreTrainedModel):
 
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape)
+        extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape, inputs_embeds.device)
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
